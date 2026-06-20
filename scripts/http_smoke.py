@@ -13,18 +13,18 @@ from urllib.request import Request, urlopen
 
 
 ROOT = Path(__file__).resolve().parents[1]
-BASE_URL = "http://127.0.0.1:8799"
+BASE_URL = "http://127.0.0.1:{port}"
 
 
-def request_json(path: str, payload: dict | None = None, timeout: int = 10) -> tuple[int, dict]:
+def request_json(path: str, payload: dict | None = None, timeout: int = 10, port: int = 8799, headers: dict | None = None) -> tuple[int, dict]:
     data = None
-    headers = {}
+    request_headers = dict(headers or {})
     method = "GET"
     if payload is not None:
         data = json.dumps(payload).encode("utf-8")
-        headers["content-type"] = "application/json"
+        request_headers["content-type"] = "application/json"
         method = "POST"
-    request = Request(f"{BASE_URL}{path}", data=data, headers=headers, method=method)
+    request = Request(f"{BASE_URL.format(port=port)}{path}", data=data, headers=request_headers, method=method)
     try:
         with urlopen(request, timeout=timeout) as response:
             return response.status, json.loads(response.read().decode("utf-8"))
@@ -32,7 +32,7 @@ def request_json(path: str, payload: dict | None = None, timeout: int = 10) -> t
         return exc.code, json.loads(exc.read().decode("utf-8"))
 
 
-def wait_for_health(process: subprocess.Popen[str]) -> None:
+def wait_for_health(process: subprocess.Popen[str], port: int = 8799, headers: dict | None = None) -> None:
     deadline = time.time() + 20
     last_error = ""
     while time.time() < deadline:
@@ -41,7 +41,7 @@ def wait_for_health(process: subprocess.Popen[str]) -> None:
             stderr = process.stderr.read() if process.stderr else ""
             raise RuntimeError(f"parser server exited early: {process.returncode}\nstdout={stdout}\nstderr={stderr}")
         try:
-            status, payload = request_json("/health", timeout=2)
+            status, payload = request_json("/health", timeout=2, port=port, headers=headers)
             if status == 200 and payload.get("ok"):
                 return
         except Exception as exc:
@@ -50,7 +50,7 @@ def wait_for_health(process: subprocess.Popen[str]) -> None:
     raise RuntimeError(f"parser server did not become healthy: {last_error}")
 
 
-def main() -> int:
+def start_server(port: int, extra_args: list[str] | None = None) -> subprocess.Popen[str]:
     command = [
         sys.executable,
         "-m",
@@ -59,7 +59,7 @@ def main() -> int:
         "--host",
         "127.0.0.1",
         "--port",
-        "8799",
+        str(port),
         "--timeout",
         "30",
         "--max-workers",
@@ -68,21 +68,52 @@ def main() -> int:
         str(256 * 1024),
         "--job-ttl",
         "60",
+        "--max-jobs",
+        "1",
     ]
-    process = subprocess.Popen(command, cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    command.extend(extra_args or [])
+    return subprocess.Popen(command, cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+def stop_server(process: subprocess.Popen[str]) -> None:
+    process.terminate()
     try:
-        wait_for_health(process)
-        status, parsed = request_json("/parse", {"input": str(ROOT / "README.md")})
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
+
+
+def assert_command_fails(args: list[str], expected: str) -> None:
+    completed = subprocess.run([sys.executable, "-m", "mystand_parser_tools", *args], cwd=ROOT, text=True, capture_output=True, timeout=10)
+    assert completed.returncode != 0, completed.stdout
+    assert expected in (completed.stderr + completed.stdout), completed.stderr + completed.stdout
+
+
+def main() -> int:
+    assert_command_fails(["serve", "--host", "0.0.0.0", "--port", "8797"], "Refusing public parser bind")
+    assert_command_fails(["serve", "--host", "0.0.0.0", "--port", "8797", "--allow-public-bind"], "requires MYSTAND_PARSER_HTTP_TOKEN")
+    assert_command_fails(["serve", "--host", "127.0.0.1", "--port", "8797", "--require-token"], "require-token mode requires")
+
+    process = start_server(8799)
+    try:
+        wait_for_health(process, port=8799)
+        status, parsed = request_json("/parse", {"input": str(ROOT / "README.md")}, port=8799)
         assert status == 200, parsed
         assert parsed["ok"] is True, parsed
         assert parsed["result"]["content"]["markdown"], parsed
 
-        status, queued = request_json("/jobs", {"input": str(ROOT / "README.md")})
+        status, failed_parse = request_json("/parse", {"input": str(ROOT / "missing-smoke-file.md")}, port=8799)
+        assert status == 422, failed_parse
+        assert failed_parse["error"] == "parser_errors", failed_parse
+        assert failed_parse["message"], failed_parse
+
+        status, queued = request_json("/jobs", {"input": str(ROOT / "README.md")}, port=8799)
         assert status == 202, queued
         job_id = queued["job"]["id"]
         deadline = time.time() + 20
         while time.time() < deadline:
-            status, job_payload = request_json(f"/jobs/{job_id}")
+            status, job_payload = request_json(f"/jobs/{job_id}", port=8799)
             assert status == 200, job_payload
             job = job_payload["job"]
             if job["status"] in {"done", "failed"}:
@@ -93,17 +124,28 @@ def main() -> int:
         else:
             raise AssertionError(f"job did not finish: {job_id}")
 
-        status, too_large = request_json("/parse", {"input": "x" * (300 * 1024)})
+        status, queue_full = request_json("/jobs", {"input": str(ROOT / "README.md")}, port=8799)
+        assert status == 429, queue_full
+        assert queue_full["error"] == "queue_full", queue_full
+
+        status, too_large = request_json("/parse", {"input": "x" * (300 * 1024)}, port=8799)
         assert status == 413, too_large
         assert too_large["error"] == "body_too_large", too_large
     finally:
-        process.terminate()
-        try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=5)
-    print(json.dumps({"ok": True, "service": BASE_URL}, ensure_ascii=False))
+        stop_server(process)
+
+    token_process = start_server(8800, ["--host", "0.0.0.0", "--allow-public-bind", "--token", "parser-smoke-token", "--require-token"])
+    try:
+        wait_for_health(token_process, port=8800, headers={"authorization": "Bearer parser-smoke-token"})
+        status, unauthorized = request_json("/health", port=8800)
+        assert status == 401, unauthorized
+        status, authorized = request_json("/health", port=8800, headers={"x-mystand-parser-token": "parser-smoke-token"})
+        assert status == 200, authorized
+        assert authorized["bind"]["tokenRequired"] is True, authorized
+    finally:
+        stop_server(token_process)
+
+    print(json.dumps({"ok": True, "service": BASE_URL.format(port=8799)}, ensure_ascii=False))
     return 0
 
 

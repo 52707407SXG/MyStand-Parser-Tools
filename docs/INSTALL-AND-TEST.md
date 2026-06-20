@@ -46,6 +46,10 @@
 - HTTP smoke 能启动本机服务并通过 `/health`、`/parse`、`/jobs`。
 - `serve --host 0.0.0.0` 未加 `--allow-public-bind` 时必须拒绝启动。
 - 公开绑定必须配置 `MYSTAND_PARSER_HTTP_TOKEN` 或 `--token`。
+- `--require-token` 未配置 token 时必须拒绝启动。
+- 带 token 的公开绑定服务必须拒绝无 token 请求，并接受 `Authorization` 或 `x-mystand-parser-token`。
+- `/parse` 失败时顶层必须有 `error/message`。
+- `/jobs` 超过 `MYSTAND_PARSER_MAX_JOBS` 或 `--max-jobs` 时必须返回 `queue_full`。
 
 ## CI 命令
 

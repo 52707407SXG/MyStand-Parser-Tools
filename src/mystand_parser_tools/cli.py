@@ -662,7 +662,9 @@ def run_serve_command(argv: list[str]) -> int:
     parser.add_argument("--timeout", type=int, default=int(os.environ.get("MYSTAND_PARSER_JOB_TIMEOUT", "90")))
     parser.add_argument("--max-body-bytes", type=int, default=int(os.environ.get("MYSTAND_PARSER_HTTP_MAX_BODY_BYTES", str(1024 * 1024))))
     parser.add_argument("--job-ttl", type=int, default=int(os.environ.get("MYSTAND_PARSER_JOB_TTL_SECONDS", str(24 * 60 * 60))))
+    parser.add_argument("--max-jobs", type=int, default=int(os.environ.get("MYSTAND_PARSER_MAX_JOBS", "100")))
     parser.add_argument("--token", default=os.environ.get("MYSTAND_PARSER_HTTP_TOKEN", ""))
+    parser.add_argument("--require-token", action="store_true", help="Require a parser HTTP token even for localhost clients.")
     parser.add_argument("--allow-public-bind", action="store_true", help="Allow binding to non-localhost addresses. Requires an HTTP token.")
     args = parser.parse_args(argv)
     run_server(
@@ -672,8 +674,10 @@ def run_serve_command(argv: list[str]) -> int:
         timeout=args.timeout,
         max_body_bytes=args.max_body_bytes,
         ttl_seconds=args.job_ttl,
+        max_jobs=args.max_jobs,
         http_token=args.token,
         allow_public_bind=args.allow_public_bind,
+        require_token=args.require_token,
     )
     return 0
 

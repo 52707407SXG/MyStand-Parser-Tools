@@ -19,12 +19,14 @@ from typing import Any
 LOCAL_BIND_HOSTS = {"127.0.0.1", "localhost", "::1"}
 DEFAULT_MAX_BODY_BYTES = int(os.environ.get("MYSTAND_PARSER_HTTP_MAX_BODY_BYTES", str(1024 * 1024)))
 DEFAULT_JOB_TTL_SECONDS = int(os.environ.get("MYSTAND_PARSER_JOB_TTL_SECONDS", str(24 * 60 * 60)))
+DEFAULT_MAX_JOBS = int(os.environ.get("MYSTAND_PARSER_MAX_JOBS", "100"))
 
 
 class ParserJobQueue:
-    def __init__(self, max_workers: int = 2, timeout: int = 90, ttl_seconds: int = DEFAULT_JOB_TTL_SECONDS):
+    def __init__(self, max_workers: int = 2, timeout: int = 90, ttl_seconds: int = DEFAULT_JOB_TTL_SECONDS, max_jobs: int = DEFAULT_MAX_JOBS):
         self.timeout = timeout
         self.ttl_seconds = ttl_seconds
+        self.max_jobs = max_jobs
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         self.sync_semaphore = threading.BoundedSemaphore(max_workers)
         self.jobs: dict[str, dict[str, Any]] = {}
@@ -32,8 +34,17 @@ class ParserJobQueue:
 
     def submit(self, input_uri: str) -> dict[str, Any]:
         self.cleanup()
+        with self.lock:
+            if len(self.jobs) >= self.max_jobs:
+                return {
+                    "ok": False,
+                    "error": "queue_full",
+                    "message": f"parser job queue is full: {len(self.jobs)} >= {self.max_jobs}",
+                    "status": "rejected",
+                }
         job_id = uuid.uuid4().hex
         record = {
+            "ok": True,
             "id": job_id,
             "input": input_uri,
             "status": "pending",
@@ -63,11 +74,14 @@ class ParserJobQueue:
             }
         try:
             parsed = run_parser_process(input_uri, self.timeout)
+            failure = summarize_parse_failure(parsed)
             return {
                 "ok": parsed["ok"],
                 "status": "done" if parsed["ok"] else "failed",
                 "result": parsed.get("payload") or {},
-                "error": parsed.get("error", ""),
+                "error": "" if parsed["ok"] else failure["error"],
+                "message": "" if parsed["ok"] else failure["message"],
+                "stderr": parsed.get("error", ""),
             }
         finally:
             self.sync_semaphore.release()
@@ -93,12 +107,15 @@ class ParserJobQueue:
         if not record:
             return
         parsed = run_parser_process(record["input"], self.timeout)
+        failure = summarize_parse_failure(parsed)
         self._patch(
             job_id,
             status="done" if parsed["ok"] else "failed",
             finishedAt=now_ms(),
             result=parsed.get("payload") or {},
-            error=parsed.get("error", ""),
+            error="" if parsed["ok"] else failure["error"],
+            message="" if parsed["ok"] else failure["message"],
+            stderr=parsed.get("error", ""),
         )
 
     def _patch(self, job_id: str, **patch: Any) -> None:
@@ -114,16 +131,21 @@ def run_server(
     timeout: int = 90,
     max_body_bytes: int = DEFAULT_MAX_BODY_BYTES,
     ttl_seconds: int = DEFAULT_JOB_TTL_SECONDS,
+    max_jobs: int = DEFAULT_MAX_JOBS,
     http_token: str | None = None,
     allow_public_bind: bool = False,
+    require_token: bool = False,
 ) -> None:
     http_token = os.environ.get("MYSTAND_PARSER_HTTP_TOKEN", "") if http_token is None else http_token
+    require_token = require_token or os.environ.get("MYSTAND_PARSER_REQUIRE_TOKEN", "").lower() in {"1", "true", "yes", "on"}
     if not is_local_bind(host) and not allow_public_bind:
         raise SystemExit("Refusing public parser bind. Use --allow-public-bind intentionally.")
     if not is_local_bind(host) and not http_token:
         raise SystemExit("Public parser bind requires MYSTAND_PARSER_HTTP_TOKEN or --token.")
+    if require_token and not http_token:
+        raise SystemExit("Parser require-token mode requires MYSTAND_PARSER_HTTP_TOKEN or --token.")
 
-    queue = ParserJobQueue(max_workers=max_workers, timeout=timeout, ttl_seconds=ttl_seconds)
+    queue = ParserJobQueue(max_workers=max_workers, timeout=timeout, ttl_seconds=ttl_seconds, max_jobs=max_jobs)
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "MyStandParserHTTP/0.1"
@@ -139,7 +161,7 @@ def run_server(
                         "name": "mystand-parser-tools",
                         "bind": {"host": host, "port": port, "public": not is_local_bind(host), "tokenRequired": bool(http_token)},
                         "limits": {"maxBodyBytes": max_body_bytes},
-                        "jobs": {"timeout": timeout, "maxWorkers": max_workers, "ttlSeconds": ttl_seconds},
+                        "jobs": {"timeout": timeout, "maxWorkers": max_workers, "ttlSeconds": ttl_seconds, "maxJobs": max_jobs},
                     },
                 )
                 return
@@ -170,7 +192,11 @@ def run_server(
                 if not input_uri:
                     self._json(400, {"ok": False, "error": "invalid_input", "message": "jobs requires input/path/url"})
                     return
-                self._json(202, {"ok": True, "job": queue.submit(input_uri)})
+                queued = queue.submit(input_uri)
+                if not queued.get("ok", True):
+                    self._json(429, queued)
+                    return
+                self._json(202, {"ok": True, "job": queued})
                 return
             self._json(404, {"ok": False, "error": "route_not_found"})
 
@@ -243,6 +269,17 @@ def run_parser_process(input_uri: str, timeout: int) -> dict[str, Any]:
             output_path.unlink()
         except OSError:
             pass
+
+
+def summarize_parse_failure(parsed: dict[str, Any]) -> dict[str, str]:
+    payload = parsed.get("payload") or {}
+    errors = payload.get("errors") if isinstance(payload, dict) else []
+    if isinstance(errors, list) and errors:
+        return {"error": "parser_errors", "message": str(errors[0])}
+    stderr = str(parsed.get("error") or "").strip()
+    if stderr:
+        return {"error": "parser_process_failed", "message": stderr}
+    return {"error": "parser_failed", "message": "parser failed without a structured error"}
 
 
 def is_local_bind(host: str) -> bool:

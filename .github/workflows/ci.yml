@@ -22,5 +22,13 @@ jobs:
           python -m pip install -r requirements.txt
       - name: Verify generated parser samples
         run: python scripts/verify_parser_samples.py
-      - name: Smoke HTTP import
+      - name: Smoke installed compatibility links
+        run: |
+          PREFIX="$(mktemp -d)"
+          python -m mystand_parser_tools install-links --prefix "$PREFIX"
+          "$PREFIX/bin/mystand-parser" --input README.md --output "$PREFIX/readme-bin.json"
+          "$PREFIX/mystand-parser" --input README.md --output "$PREFIX/readme-legacy.json"
+      - name: Compile Python modules
         run: python -m compileall src scripts
+      - name: Smoke HTTP service
+        run: python scripts/http_smoke.py

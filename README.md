@@ -34,7 +34,7 @@ mystand-parser --input README.md --output test-output/readme.json
 启动本机内部 HTTP 服务：
 
 ```bash
-mystand-parser serve --host 127.0.0.1 --port 8790
+mystand-parser serve --host 127.0.0.1 --port 8790 --timeout 90 --max-workers 2
 ```
 
 接口：
@@ -44,7 +44,26 @@ mystand-parser serve --host 127.0.0.1 --port 8790
 - `POST /jobs`
 - `GET /jobs/:id`
 
-第一版 HTTP 服务只给本机或内网 Agent 调用，不做公网鉴权；不要直接暴露到公网。
+HTTP 服务只给本机或受控内网 Agent 调用，不允许裸奔公网。默认只建议监听 `127.0.0.1`。如果要绑定 `0.0.0.0`，必须显式加 `--allow-public-bind`，并配置 HTTP token：
+
+```bash
+MYSTAND_PARSER_HTTP_TOKEN=change-me \
+mystand-parser serve --host 0.0.0.0 --port 8790 --allow-public-bind
+```
+
+请求时带：
+
+```bash
+Authorization: Bearer change-me
+```
+
+或：
+
+```bash
+x-mystand-parser-token: change-me
+```
+
+如果 token 为空，服务只接受本机客户端。`/parse` 有请求体大小限制、同步解析并发限制和超时；重任务建议走 `/jobs`。
 
 ## Standard Output
 
@@ -116,6 +135,15 @@ curl http://127.0.0.1:8790/health
 curl -s http://127.0.0.1:8790/parse \
   -H 'content-type: application/json' \
   -d '{"input":"README.md"}'
+curl -s http://127.0.0.1:8790/jobs \
+  -H 'content-type: application/json' \
+  -d '{"input":"README.md"}'
+```
+
+CI 里的真实 HTTP smoke：
+
+```bash
+python scripts/http_smoke.py
 ```
 
 验证真实公众号链接：

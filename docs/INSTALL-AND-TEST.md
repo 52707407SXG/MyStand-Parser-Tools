@@ -42,3 +42,15 @@
 - Markdown 能保留标题/列表/表格基本结构。
 - JSON 能描述 source/content/assets/warnings/errors。
 - 失败时返回明确错误，不静默成功。
+- `install-links` 生成的 `bin/mystand-parser` 和兼容旧路径都能执行。
+- HTTP smoke 能启动本机服务并通过 `/health`、`/parse`、`/jobs`。
+- `serve --host 0.0.0.0` 未加 `--allow-public-bind` 时必须拒绝启动。
+- 公开绑定必须配置 `MYSTAND_PARSER_HTTP_TOKEN` 或 `--token`。
+
+## CI 命令
+
+```bash
+python scripts/verify_parser_samples.py
+python -m compileall src scripts
+python scripts/http_smoke.py
+```

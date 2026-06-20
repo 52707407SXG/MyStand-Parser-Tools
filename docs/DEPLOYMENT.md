@@ -58,7 +58,7 @@ $MYSTAND_PARSER_COMMAND --input <文件或URL> --output <结果.json>
 如果模块更适合 HTTP 调用，可启动本机内部服务：
 
 ```bash
-mystand-parser serve --host 127.0.0.1 --port 8790
+mystand-parser serve --host 127.0.0.1 --port 8790 --timeout 90 --max-workers 2 --job-ttl 86400
 ```
 
 内部接口：
@@ -68,7 +68,28 @@ mystand-parser serve --host 127.0.0.1 --port 8790
 - `POST /jobs`
 - `GET /jobs/:id`
 
-`/jobs` 使用轻量本地队列，包含 job id、pending/running/done/failed 状态、timeout 和临时文件清理。第一版不做公网鉴权，必须只监听 `127.0.0.1` 或受控内网。
+`/parse` 会走同步解析并受 timeout、并发和请求体大小限制；重活建议走 `/jobs`。`/jobs` 使用轻量本地队列，包含 job id、pending/running/done/failed 状态、timeout、TTL 清理和临时文件清理。
+
+默认空 token 只允许本机客户端。公开绑定必须显式确认并配置 token：
+
+```bash
+MYSTAND_PARSER_HTTP_TOKEN=change-me \
+mystand-parser serve --host 0.0.0.0 --port 8790 --allow-public-bind
+```
+
+请求头：
+
+```text
+Authorization: Bearer change-me
+```
+
+或：
+
+```text
+x-mystand-parser-token: change-me
+```
+
+HTTP 服务不得裸奔公网；生产建议仍由 My Stand 后端或内网网关代理。
 
 ## 站小伴接入方式
 
@@ -94,3 +115,6 @@ mystand-parser serve --host 127.0.0.1 --port 8790
 - ZIP 文件数量通过 `MYSTAND_PARSER_ZIP_MAX_FILES` 控制。
 - ZIP 路径穿越会被拦截。
 - URL 只允许 `http` / `https`，并拦截 localhost、内网 IP、`.local`、`.internal`、`.lan`，包含 DNS 解析到内网的情况。
+- HTTP 请求体大小通过 `MYSTAND_PARSER_HTTP_MAX_BODY_BYTES` 或 `--max-body-bytes` 控制。
+- HTTP token 通过 `MYSTAND_PARSER_HTTP_TOKEN` 或 `--token` 控制。
+- Job TTL 通过 `MYSTAND_PARSER_JOB_TTL_SECONDS` 或 `--job-ttl` 控制，避免内存长期堆积。

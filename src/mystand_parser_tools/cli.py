@@ -660,8 +660,21 @@ def run_serve_command(argv: list[str]) -> int:
     parser.add_argument("--port", type=int, default=8790)
     parser.add_argument("--max-workers", type=int, default=int(os.environ.get("MYSTAND_PARSER_WORKERS", "2")))
     parser.add_argument("--timeout", type=int, default=int(os.environ.get("MYSTAND_PARSER_JOB_TIMEOUT", "90")))
+    parser.add_argument("--max-body-bytes", type=int, default=int(os.environ.get("MYSTAND_PARSER_HTTP_MAX_BODY_BYTES", str(1024 * 1024))))
+    parser.add_argument("--job-ttl", type=int, default=int(os.environ.get("MYSTAND_PARSER_JOB_TTL_SECONDS", str(24 * 60 * 60))))
+    parser.add_argument("--token", default=os.environ.get("MYSTAND_PARSER_HTTP_TOKEN", ""))
+    parser.add_argument("--allow-public-bind", action="store_true", help="Allow binding to non-localhost addresses. Requires an HTTP token.")
     args = parser.parse_args(argv)
-    run_server(host=args.host, port=args.port, max_workers=args.max_workers, timeout=args.timeout)
+    run_server(
+        host=args.host,
+        port=args.port,
+        max_workers=args.max_workers,
+        timeout=args.timeout,
+        max_body_bytes=args.max_body_bytes,
+        ttl_seconds=args.job_ttl,
+        http_token=args.token,
+        allow_public_bind=args.allow_public_bind,
+    )
     return 0
 
 
@@ -674,9 +687,20 @@ def run_install_links_command(argv: list[str]) -> int:
     bin_dir.mkdir(parents=True, exist_ok=True)
     target = bin_dir / "mystand-parser"
     legacy = prefix / "mystand-parser"
-    current = Path(sys.argv[0]).resolve()
-    if not target.exists():
-        target.symlink_to(current)
+    package_root = Path(__file__).resolve().parents[1]
+    launcher = "\n".join(
+        [
+            "#!/usr/bin/env bash",
+            "set -euo pipefail",
+            f"export PYTHONPATH={json.dumps(str(package_root))}${{PYTHONPATH:+:$PYTHONPATH}}",
+            f"exec {json.dumps(sys.executable)} -m mystand_parser_tools \"$@\"",
+            "",
+        ]
+    )
+    target.write_text(launcher, encoding="utf-8")
+    target.chmod(0o755)
+    if legacy.exists() or legacy.is_symlink():
+        legacy.unlink()
     if not legacy.exists():
         legacy.symlink_to(target)
     print(json.dumps({"ok": True, "target": str(target), "legacy": str(legacy)}, ensure_ascii=False, indent=2))

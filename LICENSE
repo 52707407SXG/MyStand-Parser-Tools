@@ -1,0 +1,9 @@
+Copyright (c) 2026 My Stand.
+
+All rights reserved.
+
+MyStand-Parser-Tools is provided for My Stand internal and authorized deployment use only. You may clone, install, modify, and run this repository for My Stand development, testing, server deployment, and approved Agent/module integrations.
+
+You may not redistribute, sublicense, sell, publish private deployment details, expose customer data, or use this software to bypass platform authorization, website access controls, or document permissions.
+
+Third-party libraries keep their own licenses. See docs/THIRD-PARTY.md and the dependency metadata for details.

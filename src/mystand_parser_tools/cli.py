@@ -12,10 +12,12 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
+import ipaddress
 import json
 import mimetypes
 import os
 import re
+import socket
 import subprocess
 import sys
 import tempfile
@@ -29,6 +31,12 @@ from xml.dom import minidom
 
 SUPPORTED_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
 PLAIN_TEXT_EXTS = {".md", ".markdown", ".txt", ".log"}
+WORKER_REQUIRED_EXTS = {".dwg", ".mp4", ".mov", ".avi", ".mkv", ".mp3", ".wav", ".m4a"}
+MAX_FILE_BYTES = int(os.environ.get("MYSTAND_PARSER_MAX_FILE_BYTES", str(50 * 1024 * 1024)))
+MAX_PDF_BYTES = int(os.environ.get("MYSTAND_PARSER_MAX_PDF_BYTES", str(30 * 1024 * 1024)))
+ZIP_MAX_TOTAL_BYTES = int(os.environ.get("MYSTAND_PARSER_ZIP_MAX_TOTAL_BYTES", str(80 * 1024 * 1024)))
+ZIP_MAX_FILES = int(os.environ.get("MYSTAND_PARSER_ZIP_MAX_FILES", "200"))
+BLOCKED_HOST_SUFFIXES = (".local", ".internal", ".lan")
 URL_AUTH_PATTERNS = [
     "secondary verification",
     "u2f",
@@ -193,6 +201,7 @@ def parse_xml_file(path: Path, result: dict[str, Any]) -> str:
 
 
 def fetch_url(url: str) -> str:
+    validate_url_allowed(url)
     request = Request(url, headers={"User-Agent": "MyStandParser/1.0"})
     with urlopen(request, timeout=20) as response:
         charset = response.headers.get_content_charset() or "utf-8"
@@ -431,6 +440,10 @@ def parse_zip(path: Path, result: dict[str, Any]) -> str:
     try:
         with zipfile.ZipFile(path) as archive:
             names = archive.namelist()
+            zip_errors = validate_zip_members(archive)
+            if zip_errors:
+                result["errors"].extend(zip_errors)
+                return ""
             result["assets"].append({"type": "archive", "path": str(path), "entries": names})
             lines = ["# ZIP 资料包", "", "## 文件列表", ""]
             lines.extend(f"- {name}" for name in names)
@@ -456,6 +469,10 @@ def parse_path(path: Path, result: dict[str, Any]) -> dict[str, Any]:
         return finalize(result, "", "missing-file")
 
     ext = path.suffix.lower()
+    guard_errors = validate_local_file(path, ext)
+    if guard_errors:
+        result["errors"].extend(guard_errors)
+        return finalize(result, "", "worker-required" if any("worker_required" in item for item in guard_errors) else "security-guard")
     if ext in PLAIN_TEXT_EXTS:
         return finalize(result, read_text_file(path), "native-text")
     if ext == ".csv":
@@ -470,8 +487,13 @@ def parse_path(path: Path, result: dict[str, Any]) -> dict[str, Any]:
         return finalize(result, parse_image_ocr(path, result), "tesseract")
     if ext == ".dxf":
         return finalize(result, parse_dxf(path, result), "ezdxf")
+    if ext == ".pdf":
+        pdf_text = parse_with_markitdown(path, result)
+        if not pdf_text.strip() and not result["errors"]:
+            result["errors"].append("worker_required: PDF 未提取到文本，可能是扫描 PDF 或图片型文件，请交给 OCR/Docling Worker。")
+        return finalize(result, pdf_text, "markitdown")
     if ext == ".dwg":
-        result["errors"].append("DWG 需要远程 CAD Worker 先转换为 DXF，本机轻解析层不直接解析 DWG。")
+        result["errors"].append("worker_required: DWG 需要远程 CAD Worker 先转换为 DXF，本机轻解析层不直接解析 DWG。")
         return finalize(result, "", "remote-cad-required")
     if ext == ".zip":
         return finalize(result, parse_zip(path, result), "native-zip")
@@ -480,6 +502,11 @@ def parse_path(path: Path, result: dict[str, Any]) -> dict[str, Any]:
 
 
 def parse_url(url: str, result: dict[str, Any]) -> dict[str, Any]:
+    try:
+        validate_url_allowed(url)
+    except ValueError as exc:
+        result["errors"].append(str(exc))
+        return finalize(result, "", "url-security-guard")
     source_type = str(result.get("source", {}).get("type") or "url")
     if source_type == "wechat_article":
         wechat_markdown = parse_wechat_article(url, result)
@@ -523,10 +550,87 @@ def parse_input(input_uri: str) -> dict[str, Any]:
     parsed = urlparse(input_uri)
     if parsed.scheme in {"http", "https"}:
         return parse_url(input_uri, result)
+    if parsed.scheme:
+        result["errors"].append("URL 只允许 http/https。")
+        return finalize(result, "", "url-security-guard")
     return parse_path(Path(input_uri).expanduser().resolve(), result)
 
 
+def validate_local_file(path: Path, ext: str) -> list[str]:
+    errors: list[str] = []
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        return [f"文件状态读取失败：{exc}"]
+    if size > MAX_FILE_BYTES:
+        errors.append(f"文件超过最大限制：{size} > {MAX_FILE_BYTES}")
+    if ext == ".pdf" and size > MAX_PDF_BYTES:
+        errors.append("worker_required: PDF 文件过大，请交给异步 Worker 处理。")
+    if ext in WORKER_REQUIRED_EXTS:
+        errors.append(f"worker_required: {ext} 需要专用 Worker，本机轻解析层不伪解析。")
+    return errors
+
+
+def validate_zip_members(archive: zipfile.ZipFile) -> list[str]:
+    errors: list[str] = []
+    infos = archive.infolist()
+    if len(infos) > ZIP_MAX_FILES:
+        errors.append(f"ZIP 文件数量超过限制：{len(infos)} > {ZIP_MAX_FILES}")
+    total = 0
+    for info in infos:
+        name = info.filename
+        parts = Path(name).parts
+        if name.startswith("/") or ".." in parts:
+            errors.append(f"ZIP 路径穿越已拦截：{name}")
+        total += int(info.file_size or 0)
+    if total > ZIP_MAX_TOTAL_BYTES:
+        errors.append(f"ZIP 解压后总大小超过限制：{total} > {ZIP_MAX_TOTAL_BYTES}")
+    return errors
+
+
+def validate_url_allowed(url: str) -> None:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError("URL 只允许 http/https。")
+    host = parsed.hostname or ""
+    if not host:
+        raise ValueError("URL 缺少 hostname。")
+    lowered = host.lower().strip(".")
+    if lowered in {"localhost", "127.0.0.1", "::1"} or lowered.endswith(BLOCKED_HOST_SUFFIXES):
+        raise ValueError("URL 指向 localhost、内网名称或保留域名，已拦截。")
+    try:
+        ip = ipaddress.ip_address(lowered)
+        if is_blocked_ip(ip):
+            raise ValueError("URL 指向内网或保留 IP，已拦截。")
+        return
+    except ValueError as exc:
+        if "已拦截" in str(exc):
+            raise
+    try:
+        infos = socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise ValueError(f"URL DNS 解析失败：{exc}") from exc
+    for info in infos:
+        address = info[4][0]
+        try:
+            ip = ipaddress.ip_address(address)
+        except ValueError:
+            continue
+        if is_blocked_ip(ip):
+            raise ValueError("URL DNS 解析到内网或保留 IP，已拦截。")
+
+
+def is_blocked_ip(ip: ipaddress._BaseAddress) -> bool:
+    return ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved or ip.is_unspecified
+
+
 def main(argv: list[str] | None = None) -> int:
+    argv = list(argv if argv is not None else sys.argv[1:])
+    if argv and argv[0] == "serve":
+        return run_serve_command(argv[1:])
+    if argv and argv[0] == "install-links":
+        return run_install_links_command(argv[1:])
+
     parser = argparse.ArgumentParser(description="Parse files or URLs into My Stand standard JSON.")
     parser.add_argument("--input", required=True, help="Local file path or http(s) URL.")
     parser.add_argument("--output", help="Write JSON result to this path. Defaults to stdout.")
@@ -546,6 +650,37 @@ def main(argv: list[str] | None = None) -> int:
         print(payload)
 
     return 1 if result["errors"] else 0
+
+
+def run_serve_command(argv: list[str]) -> int:
+    from .server import run_server
+
+    parser = argparse.ArgumentParser(description="Run MyStand Parser Tools local HTTP service.")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8790)
+    parser.add_argument("--max-workers", type=int, default=int(os.environ.get("MYSTAND_PARSER_WORKERS", "2")))
+    parser.add_argument("--timeout", type=int, default=int(os.environ.get("MYSTAND_PARSER_JOB_TIMEOUT", "90")))
+    args = parser.parse_args(argv)
+    run_server(host=args.host, port=args.port, max_workers=args.max_workers, timeout=args.timeout)
+    return 0
+
+
+def run_install_links_command(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description="Install compatibility symlinks for MyStand Parser Tools.")
+    parser.add_argument("--prefix", default="/opt/mystand-parser-tools")
+    args = parser.parse_args(argv)
+    prefix = Path(args.prefix).expanduser().resolve()
+    bin_dir = prefix / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    target = bin_dir / "mystand-parser"
+    legacy = prefix / "mystand-parser"
+    current = Path(sys.argv[0]).resolve()
+    if not target.exists():
+        target.symlink_to(current)
+    if not legacy.exists():
+        legacy.symlink_to(target)
+    print(json.dumps({"ok": True, "target": str(target), "legacy": str(legacy)}, ensure_ascii=False, indent=2))
+    return 0
 
 
 if __name__ == "__main__":

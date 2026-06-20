@@ -26,6 +26,19 @@ chmod +x bin/mystand-parser
 ln -sf /opt/mystand-parser-tools/bin/mystand-parser /usr/local/bin/mystand-parser
 ```
 
+兼容旧路径：
+
+```bash
+/opt/mystand-parser-tools/bin/mystand-parser install-links --prefix /opt/mystand-parser-tools
+```
+
+这会同时保留：
+
+```text
+/opt/mystand-parser-tools/bin/mystand-parser
+/opt/mystand-parser-tools/mystand-parser
+```
+
 ## My Stand / Agent 接口
 
 服务端统一配置：
@@ -42,6 +55,21 @@ MYSTAND_AGENT_PARSER_CONCURRENCY=3
 $MYSTAND_PARSER_COMMAND --input <文件或URL> --output <结果.json>
 ```
 
+如果模块更适合 HTTP 调用，可启动本机内部服务：
+
+```bash
+mystand-parser serve --host 127.0.0.1 --port 8790
+```
+
+内部接口：
+
+- `GET /health`
+- `POST /parse`
+- `POST /jobs`
+- `GET /jobs/:id`
+
+`/jobs` 使用轻量本地队列，包含 job id、pending/running/done/failed 状态、timeout 和临时文件清理。第一版不做公网鉴权，必须只监听 `127.0.0.1` 或受控内网。
+
 ## 站小伴接入方式
 
 站小伴本体只保留 `ParserAdapter`：
@@ -57,3 +85,12 @@ $MYSTAND_PARSER_COMMAND --input <文件或URL> --output <结果.json>
 ## Worker 扩展
 
 主站本机只承担轻解析。复杂扫描 PDF、复杂 OCR、DWG/CAD 转换、Docling/MinerU、视觉理解可接独立 Parser Worker，但仍返回同一 JSON。
+
+## 安全限制
+
+- 最大文件大小通过 `MYSTAND_PARSER_MAX_FILE_BYTES` 控制。
+- PDF 大小通过 `MYSTAND_PARSER_MAX_PDF_BYTES` 控制，超限返回 `worker_required`。
+- ZIP 总大小通过 `MYSTAND_PARSER_ZIP_MAX_TOTAL_BYTES` 控制。
+- ZIP 文件数量通过 `MYSTAND_PARSER_ZIP_MAX_FILES` 控制。
+- ZIP 路径穿越会被拦截。
+- URL 只允许 `http` / `https`，并拦截 localhost、内网 IP、`.local`、`.internal`、`.lan`，包含 DNS 解析到内网的情况。

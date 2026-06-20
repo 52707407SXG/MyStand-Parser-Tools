@@ -31,6 +31,21 @@ python -m mystand_parser_tools --input README.md --output test-output/readme.jso
 mystand-parser --input README.md --output test-output/readme.json
 ```
 
+启动本机内部 HTTP 服务：
+
+```bash
+mystand-parser serve --host 127.0.0.1 --port 8790
+```
+
+接口：
+
+- `GET /health`
+- `POST /parse`
+- `POST /jobs`
+- `GET /jobs/:id`
+
+第一版 HTTP 服务只给本机或内网 Agent 调用，不做公网鉴权；不要直接暴露到公网。
+
 ## Standard Output
 
 ```json
@@ -70,6 +85,15 @@ mystand-parser --input README.md --output test-output/readme.json
 - ZIP：列出文件，并读取包内文本类文件。
 - 飞书/WPS/公众号网页：按 URL 类型识别；动态页面可走 `agent-browser` 兜底。
 
+## Safety Guards
+
+- 限制最大文件大小。
+- 限制 ZIP 解压后总大小和文件数量。
+- 拦截 ZIP 路径穿越。
+- URL 只允许 `http` / `https`。
+- 拦截 localhost、内网 IP、`.local`、`.internal`、`.lan`，包括 DNS 解析到内网的情况。
+- DWG、超大 PDF、视频、音频等返回 `worker_required`，不伪解析。
+
 详见：
 
 - `docs/TOOLS.md`
@@ -82,6 +106,16 @@ mystand-parser --input README.md --output test-output/readme.json
 
 ```bash
 python scripts/verify_parser_samples.py
+```
+
+HTTP 服务本机测试：
+
+```bash
+mystand-parser serve --host 127.0.0.1 --port 8790
+curl http://127.0.0.1:8790/health
+curl -s http://127.0.0.1:8790/parse \
+  -H 'content-type: application/json' \
+  -d '{"input":"README.md"}'
 ```
 
 验证真实公众号链接：

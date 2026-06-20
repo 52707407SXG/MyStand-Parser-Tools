@@ -70,6 +70,10 @@ def start_server(port: int, extra_args: list[str] | None = None) -> subprocess.P
         "60",
         "--max-jobs",
         "1",
+        "--job-history-ttl",
+        "60",
+        "--max-job-history",
+        "1",
     ]
     command.extend(extra_args or [])
     return subprocess.Popen(command, cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -88,6 +92,20 @@ def assert_command_fails(args: list[str], expected: str) -> None:
     completed = subprocess.run([sys.executable, "-m", "mystand_parser_tools", *args], cwd=ROOT, text=True, capture_output=True, timeout=10)
     assert completed.returncode != 0, completed.stdout
     assert expected in (completed.stderr + completed.stdout), completed.stderr + completed.stdout
+
+
+def wait_for_job(job_id: str, port: int = 8799) -> dict:
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        status, job_payload = request_json(f"/jobs/{job_id}", port=port)
+        assert status == 200, job_payload
+        job = job_payload["job"]
+        if job["status"] in {"done", "failed"}:
+            assert job["status"] == "done", job
+            assert job["result"]["content"]["markdown"], job
+            return job
+        time.sleep(0.25)
+    raise AssertionError(f"job did not finish: {job_id}")
 
 
 def main() -> int:
@@ -111,28 +129,32 @@ def main() -> int:
         status, queued = request_json("/jobs", {"input": str(ROOT / "README.md")}, port=8799)
         assert status == 202, queued
         job_id = queued["job"]["id"]
-        deadline = time.time() + 20
-        while time.time() < deadline:
-            status, job_payload = request_json(f"/jobs/{job_id}", port=8799)
-            assert status == 200, job_payload
-            job = job_payload["job"]
-            if job["status"] in {"done", "failed"}:
-                assert job["status"] == "done", job
-                assert job["result"]["content"]["markdown"], job
-                break
-            time.sleep(0.25)
-        else:
-            raise AssertionError(f"job did not finish: {job_id}")
+        wait_for_job(job_id, port=8799)
 
-        status, queue_full = request_json("/jobs", {"input": str(ROOT / "README.md")}, port=8799)
-        assert status == 429, queue_full
-        assert queue_full["error"] == "queue_full", queue_full
+        status, queued_again = request_json("/jobs", {"input": str(ROOT / "README.md")}, port=8799)
+        assert status == 202, queued_again
+        second_job_id = queued_again["job"]["id"]
+        wait_for_job(second_job_id, port=8799)
+        status, old_history = request_json(f"/jobs/{job_id}", port=8799)
+        assert status == 404, old_history
+        assert old_history["error"] == "job_not_found", old_history
+        status, second_history = request_json(f"/jobs/{second_job_id}", port=8799)
+        assert status == 200, second_history
 
         status, too_large = request_json("/parse", {"input": "x" * (300 * 1024)}, port=8799)
         assert status == 413, too_large
         assert too_large["error"] == "body_too_large", too_large
     finally:
         stop_server(process)
+
+    full_process = start_server(8801, ["--max-jobs", "0"])
+    try:
+        wait_for_health(full_process, port=8801)
+        status, queue_full = request_json("/jobs", {"input": str(ROOT / "README.md")}, port=8801)
+        assert status == 429, queue_full
+        assert queue_full["error"] == "queue_full", queue_full
+    finally:
+        stop_server(full_process)
 
     token_process = start_server(8800, ["--host", "0.0.0.0", "--allow-public-bind", "--token", "parser-smoke-token", "--require-token"])
     try:

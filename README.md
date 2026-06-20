@@ -34,7 +34,7 @@ mystand-parser --input README.md --output test-output/readme.json
 启动本机内部 HTTP 服务：
 
 ```bash
-mystand-parser serve --host 127.0.0.1 --port 8790 --timeout 90 --max-workers 2
+mystand-parser serve --host 127.0.0.1 --port 8790 --timeout 90 --max-workers 2 --max-jobs 100 --max-job-history 1000
 ```
 
 接口：
@@ -65,7 +65,9 @@ x-mystand-parser-token: change-me
 
 如果 token 为空，服务只接受本机客户端。只要经过 Nginx 或其他反代，即使 parser 绑定 `127.0.0.1`，也必须配置 token 并加 `--require-token`，因为服务看到的客户端会是本机反代。
 
-`/parse` 有请求体大小限制、同步解析并发限制和超时；失败时顶层会返回 `error/message`，真实 parser 结果仍在 `result.errors`。重任务建议走 `/jobs`，队列长度由 `MYSTAND_PARSER_MAX_JOBS` 或 `--max-jobs` 控制。
+`/parse` 有请求体大小限制、同步解析并发限制和超时；失败时顶层会返回 `error/message`，真实 parser 结果仍在 `result.errors`。重任务建议走 `/jobs`。
+
+`MYSTAND_PARSER_MAX_JOBS` / `--max-jobs` 只限制 `pending/running` 活跃任务，不把已经 `done/failed` 的历史记录算进去；完成记录由 `MYSTAND_PARSER_MAX_JOB_HISTORY` / `--max-job-history` 和 `MYSTAND_PARSER_JOB_HISTORY_TTL_SECONDS` / `--job-history-ttl` 清理。
 
 ## Standard Output
 

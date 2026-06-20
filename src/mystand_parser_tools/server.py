@@ -19,14 +19,28 @@ from typing import Any
 LOCAL_BIND_HOSTS = {"127.0.0.1", "localhost", "::1"}
 DEFAULT_MAX_BODY_BYTES = int(os.environ.get("MYSTAND_PARSER_HTTP_MAX_BODY_BYTES", str(1024 * 1024)))
 DEFAULT_JOB_TTL_SECONDS = int(os.environ.get("MYSTAND_PARSER_JOB_TTL_SECONDS", str(24 * 60 * 60)))
+DEFAULT_JOB_HISTORY_TTL_SECONDS = int(os.environ.get("MYSTAND_PARSER_JOB_HISTORY_TTL_SECONDS", str(24 * 60 * 60)))
 DEFAULT_MAX_JOBS = int(os.environ.get("MYSTAND_PARSER_MAX_JOBS", "100"))
+DEFAULT_MAX_JOB_HISTORY = int(os.environ.get("MYSTAND_PARSER_MAX_JOB_HISTORY", "1000"))
+ACTIVE_JOB_STATUSES = {"pending", "running"}
+TERMINAL_JOB_STATUSES = {"done", "failed", "rejected"}
 
 
 class ParserJobQueue:
-    def __init__(self, max_workers: int = 2, timeout: int = 90, ttl_seconds: int = DEFAULT_JOB_TTL_SECONDS, max_jobs: int = DEFAULT_MAX_JOBS):
+    def __init__(
+        self,
+        max_workers: int = 2,
+        timeout: int = 90,
+        ttl_seconds: int = DEFAULT_JOB_TTL_SECONDS,
+        max_jobs: int = DEFAULT_MAX_JOBS,
+        history_ttl_seconds: int = DEFAULT_JOB_HISTORY_TTL_SECONDS,
+        max_job_history: int = DEFAULT_MAX_JOB_HISTORY,
+    ):
         self.timeout = timeout
         self.ttl_seconds = ttl_seconds
         self.max_jobs = max_jobs
+        self.history_ttl_seconds = history_ttl_seconds
+        self.max_job_history = max_job_history
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         self.sync_semaphore = threading.BoundedSemaphore(max_workers)
         self.jobs: dict[str, dict[str, Any]] = {}
@@ -35,11 +49,12 @@ class ParserJobQueue:
     def submit(self, input_uri: str) -> dict[str, Any]:
         self.cleanup()
         with self.lock:
-            if len(self.jobs) >= self.max_jobs:
+            active_jobs = self._active_count_locked()
+            if active_jobs >= self.max_jobs:
                 return {
                     "ok": False,
                     "error": "queue_full",
-                    "message": f"parser job queue is full: {len(self.jobs)} >= {self.max_jobs}",
+                    "message": f"parser active job queue is full: {active_jobs} >= {self.max_jobs}",
                     "status": "rejected",
                 }
         job_id = uuid.uuid4().hex
@@ -87,19 +102,33 @@ class ParserJobQueue:
             self.sync_semaphore.release()
 
     def cleanup(self) -> int:
-        cutoff = now_ms() - max(1, self.ttl_seconds) * 1000
+        active_cutoff = now_ms() - max(1, self.ttl_seconds) * 1000
+        history_cutoff = now_ms() - max(1, self.history_ttl_seconds) * 1000
         removed = 0
         with self.lock:
             for job_id, record in list(self.jobs.items()):
+                status = str(record.get("status") or "")
                 finished_at = int(record.get("finishedAt") or 0)
                 created_at = int(record.get("createdAt") or 0)
-                if finished_at and finished_at < cutoff:
+                if finished_at and status in TERMINAL_JOB_STATUSES and finished_at < history_cutoff:
                     self.jobs.pop(job_id, None)
                     removed += 1
-                elif not finished_at and created_at and created_at < cutoff and record.get("status") in {"pending", "failed"}:
+                elif not finished_at and created_at and created_at < active_cutoff and status in ACTIVE_JOB_STATUSES:
                     self.jobs.pop(job_id, None)
                     removed += 1
+            removed += self._trim_history_locked()
         return removed
+
+    def stats(self) -> dict[str, int]:
+        self.cleanup()
+        with self.lock:
+            active = self._active_count_locked()
+            terminal = sum(1 for record in self.jobs.values() if str(record.get("status") or "") in TERMINAL_JOB_STATUSES)
+            return {
+                "active": active,
+                "history": terminal,
+                "total": len(self.jobs),
+            }
 
     def _run_job(self, job_id: str) -> None:
         self._patch(job_id, status="running", startedAt=now_ms())
@@ -117,11 +146,31 @@ class ParserJobQueue:
             message="" if parsed["ok"] else failure["message"],
             stderr=parsed.get("error", ""),
         )
+        self.cleanup()
 
     def _patch(self, job_id: str, **patch: Any) -> None:
         with self.lock:
             if job_id in self.jobs:
                 self.jobs[job_id] = {**self.jobs[job_id], **patch}
+
+    def _active_count_locked(self) -> int:
+        return sum(1 for record in self.jobs.values() if str(record.get("status") or "") in ACTIVE_JOB_STATUSES)
+
+    def _trim_history_locked(self) -> int:
+        limit = max(0, int(self.max_job_history))
+        terminal_jobs = [
+            (int(record.get("finishedAt") or record.get("createdAt") or 0), job_id)
+            for job_id, record in self.jobs.items()
+            if str(record.get("status") or "") in TERMINAL_JOB_STATUSES
+        ]
+        overflow = len(terminal_jobs) - limit
+        if overflow <= 0:
+            return 0
+        removed = 0
+        for _, job_id in sorted(terminal_jobs)[:overflow]:
+            self.jobs.pop(job_id, None)
+            removed += 1
+        return removed
 
 
 def run_server(
@@ -132,6 +181,8 @@ def run_server(
     max_body_bytes: int = DEFAULT_MAX_BODY_BYTES,
     ttl_seconds: int = DEFAULT_JOB_TTL_SECONDS,
     max_jobs: int = DEFAULT_MAX_JOBS,
+    history_ttl_seconds: int = DEFAULT_JOB_HISTORY_TTL_SECONDS,
+    max_job_history: int = DEFAULT_MAX_JOB_HISTORY,
     http_token: str | None = None,
     allow_public_bind: bool = False,
     require_token: bool = False,
@@ -145,7 +196,14 @@ def run_server(
     if require_token and not http_token:
         raise SystemExit("Parser require-token mode requires MYSTAND_PARSER_HTTP_TOKEN or --token.")
 
-    queue = ParserJobQueue(max_workers=max_workers, timeout=timeout, ttl_seconds=ttl_seconds, max_jobs=max_jobs)
+    queue = ParserJobQueue(
+        max_workers=max_workers,
+        timeout=timeout,
+        ttl_seconds=ttl_seconds,
+        max_jobs=max_jobs,
+        history_ttl_seconds=history_ttl_seconds,
+        max_job_history=max_job_history,
+    )
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "MyStandParserHTTP/0.1"
@@ -161,7 +219,15 @@ def run_server(
                         "name": "mystand-parser-tools",
                         "bind": {"host": host, "port": port, "public": not is_local_bind(host), "tokenRequired": bool(http_token)},
                         "limits": {"maxBodyBytes": max_body_bytes},
-                        "jobs": {"timeout": timeout, "maxWorkers": max_workers, "ttlSeconds": ttl_seconds, "maxJobs": max_jobs},
+                        "jobs": {
+                            "timeout": timeout,
+                            "maxWorkers": max_workers,
+                            "ttlSeconds": ttl_seconds,
+                            "maxJobs": max_jobs,
+                            "historyTtlSeconds": history_ttl_seconds,
+                            "maxJobHistory": max_job_history,
+                            **queue.stats(),
+                        },
                     },
                 )
                 return

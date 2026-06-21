@@ -35,12 +35,14 @@ class ParserJobQueue:
         max_jobs: int = DEFAULT_MAX_JOBS,
         history_ttl_seconds: int = DEFAULT_JOB_HISTORY_TTL_SECONDS,
         max_job_history: int = DEFAULT_MAX_JOB_HISTORY,
+        parser_env: dict[str, str] | None = None,
     ):
         self.timeout = timeout
         self.ttl_seconds = ttl_seconds
         self.max_jobs = max_jobs
         self.history_ttl_seconds = history_ttl_seconds
         self.max_job_history = max_job_history
+        self.parser_env = parser_env
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         self.sync_semaphore = threading.BoundedSemaphore(max_workers)
         self.jobs: dict[str, dict[str, Any]] = {}
@@ -87,7 +89,7 @@ class ParserJobQueue:
                 "message": "同步解析并发已满，请改用 /jobs 异步队列。",
             }
         try:
-            parsed = run_parser_process(input_uri, self.timeout)
+            parsed = run_parser_process(input_uri, self.timeout, env=self.parser_env)
             failure = summarize_parse_failure(parsed)
             return {
                 "ok": parsed["ok"],
@@ -134,7 +136,7 @@ class ParserJobQueue:
         record = self.get(job_id)
         if not record:
             return
-        parsed = run_parser_process(record["input"], self.timeout)
+        parsed = run_parser_process(record["input"], self.timeout, env=self.parser_env)
         failure = summarize_parse_failure(parsed)
         self._patch(
             job_id,
@@ -194,6 +196,8 @@ def run_server(
         raise SystemExit("Public parser bind requires MYSTAND_PARSER_HTTP_TOKEN or --token.")
     if require_token and not http_token:
         raise SystemExit("Parser require-token mode requires MYSTAND_PARSER_HTTP_TOKEN or --token.")
+    secure_file_mode = require_token or bool(http_token) or not is_local_bind(host)
+    parser_env = build_parser_process_env(enforce_allowed_roots=secure_file_mode)
 
     queue = ParserJobQueue(
         max_workers=max_workers,
@@ -202,6 +206,7 @@ def run_server(
         max_jobs=max_jobs,
         history_ttl_seconds=history_ttl_seconds,
         max_job_history=max_job_history,
+        parser_env=parser_env,
     )
 
     class Handler(BaseHTTPRequestHandler):
@@ -216,9 +221,14 @@ def run_server(
                     {
                         "ok": True,
                         "name": "mystand-parser-tools",
-                        "bind": {"host": host, "port": port, "public": not is_local_bind(host), "tokenRequired": bool(http_token)},
-                        "limits": {"maxBodyBytes": max_body_bytes},
-                        "jobs": {
+                            "bind": {"host": host, "port": port, "public": not is_local_bind(host), "tokenRequired": bool(http_token)},
+                            "limits": {"maxBodyBytes": max_body_bytes},
+                            "fileRead": {
+                                "enforceAllowedRoots": parser_env.get("MYSTAND_PARSER_ENFORCE_ALLOWED_ROOTS") in {"1", "true", "yes", "on"},
+                                "allowedRootsConfigured": bool(parser_env.get("MYSTAND_PARSER_ALLOWED_ROOTS", "").strip()),
+                                "allowedRootsCount": len([item for item in parser_env.get("MYSTAND_PARSER_ALLOWED_ROOTS", "").split(",") if item.strip()]),
+                            },
+                            "jobs": {
                             "timeout": timeout,
                             "maxWorkers": max_workers,
                             "ttlSeconds": ttl_seconds,
@@ -307,7 +317,7 @@ def run_server(
     server.serve_forever()
 
 
-def run_parser_process(input_uri: str, timeout: int) -> dict[str, Any]:
+def run_parser_process(input_uri: str, timeout: int, env: dict[str, str] | None = None) -> dict[str, Any]:
     output_path = Path(tempfile.gettempdir()) / f"mystand-parser-{uuid.uuid4().hex}.json"
     try:
         completed = subprocess.run(
@@ -316,6 +326,7 @@ def run_parser_process(input_uri: str, timeout: int) -> dict[str, Any]:
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=env,
         )
         payload = {}
         if output_path.exists():
@@ -345,6 +356,13 @@ def summarize_parse_failure(parsed: dict[str, Any]) -> dict[str, str]:
     if stderr:
         return {"error": "parser_process_failed", "message": stderr}
     return {"error": "parser_failed", "message": "parser failed without a structured error"}
+
+
+def build_parser_process_env(enforce_allowed_roots: bool = False) -> dict[str, str]:
+    env = os.environ.copy()
+    if enforce_allowed_roots:
+        env.setdefault("MYSTAND_PARSER_ENFORCE_ALLOWED_ROOTS", "1")
+    return env
 
 
 def is_local_bind(host: str) -> bool:

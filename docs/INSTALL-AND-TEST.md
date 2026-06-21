@@ -48,15 +48,16 @@
 - 公开绑定必须配置 `MYSTAND_PARSER_HTTP_TOKEN` 或 `--token`。
 - `--require-token` 未配置 token 时必须拒绝启动。
 - 带 token 的公开绑定服务必须拒绝无 token 请求，并接受 `Authorization` 或 `x-mystand-parser-token`。
+- HTTP/token 模式必须启用本地文件白名单；未配置 `MYSTAND_PARSER_ALLOWED_ROOTS` 时拒绝本地文件解析，配置后只允许白名单目录内文件。
 - `/parse` 失败时顶层必须有 `error/message`。
 - `/jobs` 的 `MYSTAND_PARSER_MAX_JOBS` 或 `--max-jobs` 只限制 pending/running 活跃任务；活跃数超限时必须返回 `queue_full`。
-- HTTP smoke 覆盖 URL redirect/final URL 内网拦截、agent-browser finalUrl 内网拦截，以及并发提交时 `max-jobs` 检查和 job 插入同锁。
+- HTTP smoke 覆盖 URL redirect/final URL 内网拦截、agent-browser finalUrl 内网拦截、URL 响应体超限、本地文件白名单、路径穿越拒绝，以及并发提交时 `max-jobs` 检查和 job 插入同锁。
 - 已完成 job 不得占用新任务名额；完成记录应按 `MYSTAND_PARSER_MAX_JOB_HISTORY` / `--max-job-history` 和 `MYSTAND_PARSER_JOB_HISTORY_TTL_SECONDS` / `--job-history-ttl` 清理。
 
 ## CI 命令
 
 ```bash
 python scripts/verify_parser_samples.py
-python -m compileall src scripts
+PYTHONPYCACHEPREFIX=/tmp/mystand-parser-pycache python -m compileall src scripts
 python scripts/http_smoke.py
 ```

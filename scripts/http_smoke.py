@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -57,7 +58,7 @@ def wait_for_health(process: subprocess.Popen[str], port: int = 8799, headers: d
     raise RuntimeError(f"parser server did not become healthy: {last_error}")
 
 
-def start_server(port: int, extra_args: list[str] | None = None) -> subprocess.Popen[str]:
+def start_server(port: int, extra_args: list[str] | None = None, env: dict[str, str] | None = None) -> subprocess.Popen[str]:
     command = [
         sys.executable,
         "-m",
@@ -83,7 +84,10 @@ def start_server(port: int, extra_args: list[str] | None = None) -> subprocess.P
         "1",
     ]
     command.extend(extra_args or [])
-    return subprocess.Popen(command, cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    process_env = None
+    if env is not None:
+        process_env = {**os.environ, **env}
+    return subprocess.Popen(command, cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=process_env)
 
 
 def stop_server(process: subprocess.Popen[str]) -> None:
@@ -116,16 +120,21 @@ def wait_for_job(job_id: str, port: int = 8799) -> dict:
 
 
 class _HeaderStub:
+    def __init__(self, content_length: str = ""):
+        self.content_length = content_length
+
     def get_content_charset(self) -> str:
         return "utf-8"
 
+    def get(self, key: str, default: str = "") -> str:
+        return self.content_length if key.lower() == "content-length" and self.content_length else default
+
 
 class _ResponseStub:
-    headers = _HeaderStub()
-
-    def __init__(self, final_url: str, body: str = "<html><body>ok</body></html>"):
+    def __init__(self, final_url: str, body: str = "<html><body>ok</body></html>", content_length: str = ""):
         self.final_url = final_url
         self.body = body.encode("utf-8")
+        self.headers = _HeaderStub(content_length)
 
     def __enter__(self):
         return self
@@ -136,19 +145,40 @@ class _ResponseStub:
     def geturl(self) -> str:
         return self.final_url
 
-    def read(self) -> bytes:
-        return self.body
+    def read(self, size: int = -1) -> bytes:
+        return self.body if size is None or size < 0 else self.body[:size]
 
 
 class _OpenerStub:
-    def __init__(self, final_url: str):
+    def __init__(self, final_url: str, body: str = "<html><body>ok</body></html>", content_length: str = ""):
         self.final_url = final_url
+        self.body = body
+        self.content_length = content_length
 
     def open(self, request: Request, timeout: int = 20) -> _ResponseStub:
-        return _ResponseStub(self.final_url)
+        return _ResponseStub(self.final_url, self.body, self.content_length)
 
 
 def smoke_url_final_guards() -> None:
+    blocked_urls = [
+        "http://2130706433/private",
+        "http://0177.0.0.1/private",
+        "http://0/private",
+        "http://[::ffff:127.0.0.1]/private",
+        "http://10.0.0.1/private",
+        "http://172.16.0.1/private",
+        "http://192.168.1.1/private",
+        "http://169.254.169.254/latest/meta-data",
+        "http://service.internal/private",
+    ]
+    for url in blocked_urls:
+        try:
+            parser_cli.validate_url_allowed(url)
+        except ValueError as exc:
+            assert "已拦截" in str(exc), (url, exc)
+        else:
+            raise AssertionError(f"blocked URL was accepted: {url}")
+
     try:
         parser_cli.SafeRedirectHandler().redirect_request(None, None, 302, "Found", {}, "http://127.0.0.1/internal")
     except ValueError as exc:
@@ -165,6 +195,28 @@ def smoke_url_final_guards() -> None:
             assert "已拦截" in str(exc), exc
         else:
             raise AssertionError("fetch_url accepted blocked final URL")
+        original_max_url_bytes = parser_cli.MAX_URL_BYTES
+        parser_cli.MAX_URL_BYTES = 8
+        try:
+            try:
+                parser_cli.fetch_url("https://example.com/article", opener=_OpenerStub("https://example.com/article", body="x" * 20))
+            except ValueError as exc:
+                assert "URL 响应体超过最大限制" in str(exc), exc
+            else:
+                raise AssertionError("fetch_url accepted oversized response body")
+        finally:
+            parser_cli.MAX_URL_BYTES = original_max_url_bytes
+    finally:
+        parser_cli.socket.getaddrinfo = original_getaddrinfo
+
+    parser_cli.socket.getaddrinfo = lambda *args, **kwargs: [(None, None, None, "", ("10.0.0.5", 443))]
+    try:
+        try:
+            parser_cli.validate_url_allowed("https://dns-private.example/article")
+        except ValueError as exc:
+            assert "DNS 解析到内网" in str(exc), exc
+        else:
+            raise AssertionError("DNS private IP was not blocked")
     finally:
         parser_cli.socket.getaddrinfo = original_getaddrinfo
 
@@ -228,10 +280,30 @@ def smoke_job_queue_submit_lock() -> None:
         queue.executor.shutdown(wait=True, cancel_futures=True)
 
 
+def smoke_install_links() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        completed = subprocess.run(
+            [sys.executable, "-m", "mystand_parser_tools", "install-links", "--prefix", temp_dir],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            timeout=10,
+        )
+        assert completed.returncode == 0, completed.stderr
+        payload = json.loads(completed.stdout)
+        target = Path(payload["target"])
+        legacy = Path(payload["legacy"])
+        for executable in (target, legacy):
+            help_result = subprocess.run([str(executable), "--help"], text=True, capture_output=True, timeout=10)
+            assert help_result.returncode == 0, help_result.stderr
+            assert "Parse files or URLs" in help_result.stdout, help_result.stdout
+
+
 def main() -> int:
     smoke_url_final_guards()
     smoke_agent_browser_final_guard()
     smoke_job_queue_submit_lock()
+    smoke_install_links()
 
     assert_command_fails(["serve", "--host", "0.0.0.0", "--port", "8797"], "Refusing public parser bind")
     assert_command_fails(["serve", "--host", "0.0.0.0", "--port", "8797", "--allow-public-bind"], "requires MYSTAND_PARSER_HTTP_TOKEN")
@@ -288,8 +360,49 @@ def main() -> int:
         status, authorized = request_json("/health", port=8800, headers={"x-mystand-parser-token": "parser-smoke-token"})
         assert status == 200, authorized
         assert authorized["bind"]["tokenRequired"] is True, authorized
+        assert authorized["fileRead"]["enforceAllowedRoots"] is True, authorized
+        assert authorized["fileRead"]["allowedRootsConfigured"] is False, authorized
+        status, blocked_local_file = request_json(
+            "/parse",
+            {"input": str(ROOT / "README.md")},
+            port=8800,
+            headers={"authorization": "Bearer parser-smoke-token"},
+        )
+        assert status == 422, blocked_local_file
+        assert "local_file_roots_required" in blocked_local_file["message"], blocked_local_file
     finally:
         stop_server(token_process)
+
+    outside_file = ROOT.parent / "parser-outside-smoke.md"
+    outside_file.write_text("# outside\n", encoding="utf-8")
+    try:
+        allow_headers = {"authorization": "Bearer parser-allow-token"}
+        allowed_process = start_server(
+            8802,
+            ["--token", "parser-allow-token", "--require-token"],
+            env={"MYSTAND_PARSER_ALLOWED_ROOTS": str(ROOT)},
+        )
+        try:
+            wait_for_health(allowed_process, port=8802, headers=allow_headers)
+            status, allowed_health = request_json("/health", port=8802, headers=allow_headers)
+            assert status == 200, allowed_health
+            assert allowed_health["fileRead"]["enforceAllowedRoots"] is True, allowed_health
+            assert allowed_health["fileRead"]["allowedRootsConfigured"] is True, allowed_health
+            assert allowed_health["fileRead"]["allowedRootsCount"] == 1, allowed_health
+            status, allowed_parse = request_json("/parse", {"input": str(ROOT / "README.md")}, port=8802, headers=allow_headers)
+            assert status == 200, allowed_parse
+            assert allowed_parse["ok"] is True, allowed_parse
+            status, outside_parse = request_json("/parse", {"input": str(outside_file)}, port=8802, headers=allow_headers)
+            assert status == 422, outside_parse
+            assert "outside_allowed_roots" in outside_parse["message"], outside_parse
+            traversal_input = str(ROOT / ".." / outside_file.name)
+            status, traversal_parse = request_json("/parse", {"input": traversal_input}, port=8802, headers=allow_headers)
+            assert status == 422, traversal_parse
+            assert "outside_allowed_roots" in traversal_parse["message"], traversal_parse
+        finally:
+            stop_server(allowed_process)
+    finally:
+        outside_file.unlink(missing_ok=True)
 
     print(json.dumps({"ok": True, "service": BASE_URL.format(port=8799)}, ensure_ascii=False))
     return 0

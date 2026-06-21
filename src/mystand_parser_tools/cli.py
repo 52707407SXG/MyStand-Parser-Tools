@@ -34,6 +34,7 @@ PLAIN_TEXT_EXTS = {".md", ".markdown", ".txt", ".log"}
 WORKER_REQUIRED_EXTS = {".dwg", ".mp4", ".mov", ".avi", ".mkv", ".mp3", ".wav", ".m4a"}
 MAX_FILE_BYTES = int(os.environ.get("MYSTAND_PARSER_MAX_FILE_BYTES", str(50 * 1024 * 1024)))
 MAX_PDF_BYTES = int(os.environ.get("MYSTAND_PARSER_MAX_PDF_BYTES", str(30 * 1024 * 1024)))
+MAX_URL_BYTES = int(os.environ.get("MYSTAND_PARSER_MAX_URL_BYTES", str(10 * 1024 * 1024)))
 ZIP_MAX_TOTAL_BYTES = int(os.environ.get("MYSTAND_PARSER_ZIP_MAX_TOTAL_BYTES", str(80 * 1024 * 1024)))
 ZIP_MAX_FILES = int(os.environ.get("MYSTAND_PARSER_ZIP_MAX_FILES", "200"))
 BLOCKED_HOST_SUFFIXES = (".local", ".internal", ".lan")
@@ -215,7 +216,13 @@ def fetch_url(url: str, opener: Any | None = None) -> str:
         if final_url:
             validate_url_allowed(str(final_url))
         charset = response.headers.get_content_charset() or "utf-8"
-        return response.read().decode(charset, errors="replace")
+        content_length = get_header(response.headers, "content-length")
+        if content_length and content_length.isdigit() and int(content_length) > MAX_URL_BYTES:
+            raise ValueError(f"URL 响应体超过最大限制：{content_length} > {MAX_URL_BYTES}")
+        data = response.read(MAX_URL_BYTES + 1)
+        if len(data) > MAX_URL_BYTES:
+            raise ValueError(f"URL 响应体超过最大限制：{len(data)} > {MAX_URL_BYTES}")
+        return data.decode(charset, errors="replace")
 
 
 def parse_html_text(html: str, result: dict[str, Any]) -> str:
@@ -480,6 +487,10 @@ def parse_zip(path: Path, result: dict[str, Any]) -> str:
 
 
 def parse_path(path: Path, result: dict[str, Any]) -> dict[str, Any]:
+    root_errors = validate_allowed_file_roots(path)
+    if root_errors:
+        result["errors"].extend(root_errors)
+        return finalize(result, "", "allowed-root-guard")
     if not path.exists():
         result["errors"].append(f"文件不存在：{path}")
         return finalize(result, "", "missing-file")
@@ -587,6 +598,34 @@ def validate_local_file(path: Path, ext: str) -> list[str]:
     return errors
 
 
+def validate_allowed_file_roots(path: Path) -> list[str]:
+    roots = allowed_file_roots()
+    enforce = truthy(os.environ.get("MYSTAND_PARSER_ENFORCE_ALLOWED_ROOTS", ""))
+    if not roots:
+        return ["local_file_roots_required: HTTP/production parser mode requires MYSTAND_PARSER_ALLOWED_ROOTS before reading local files."] if enforce else []
+    if any(path_is_inside(path, root) for root in roots):
+        return []
+    return [f"outside_allowed_roots: 本地文件不在 MYSTAND_PARSER_ALLOWED_ROOTS 白名单内：{path}"]
+
+
+def allowed_file_roots() -> list[Path]:
+    raw = os.environ.get("MYSTAND_PARSER_ALLOWED_ROOTS", "")
+    roots: list[Path] = []
+    for item in raw.split(","):
+        text = item.strip()
+        if text:
+            roots.append(Path(text).expanduser().resolve())
+    return roots
+
+
+def path_is_inside(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
 def validate_zip_members(archive: zipfile.ZipFile) -> list[str]:
     errors: list[str] = []
     infos = archive.infolist()
@@ -614,6 +653,9 @@ def validate_url_allowed(url: str) -> None:
     lowered = host.lower().strip(".")
     if lowered in {"localhost", "127.0.0.1", "::1"} or lowered.endswith(BLOCKED_HOST_SUFFIXES):
         raise ValueError("URL 指向 localhost、内网名称或保留域名，已拦截。")
+    for ip in direct_host_ips(lowered):
+        if is_blocked_ip(ip):
+            raise ValueError("URL 指向内网或保留 IP，已拦截。")
     try:
         ip = ipaddress.ip_address(lowered)
         if is_blocked_ip(ip):
@@ -637,7 +679,70 @@ def validate_url_allowed(url: str) -> None:
 
 
 def is_blocked_ip(ip: ipaddress._BaseAddress) -> bool:
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped and is_blocked_ip(mapped):
+        return True
     return ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved or ip.is_unspecified
+
+
+def direct_host_ips(host: str) -> list[ipaddress._BaseAddress]:
+    ips: list[ipaddress._BaseAddress] = []
+    try:
+        ips.append(ipaddress.ip_address(host))
+    except ValueError:
+        pass
+    legacy_ipv4 = parse_legacy_ipv4(host)
+    if legacy_ipv4:
+        ips.append(legacy_ipv4)
+    return ips
+
+
+def parse_legacy_ipv4(host: str) -> ipaddress.IPv4Address | None:
+    if ":" in host or not re.fullmatch(r"[0-9a-fA-FxX.]+", host or ""):
+        return None
+    parts = host.split(".")
+    if not 1 <= len(parts) <= 4:
+        return None
+    parsed: list[int] = []
+    for part in parts:
+        if not part:
+            return None
+        try:
+            parsed.append(parse_legacy_ipv4_part(part))
+        except ValueError:
+            return None
+    widths = {
+        1: [32],
+        2: [8, 24],
+        3: [8, 8, 16],
+        4: [8, 8, 8, 8],
+    }[len(parsed)]
+    value = 0
+    for number, bits in zip(parsed, widths):
+        if number < 0 or number >= (1 << bits):
+            return None
+        value = (value << bits) | number
+    return ipaddress.IPv4Address(value)
+
+
+def parse_legacy_ipv4_part(part: str) -> int:
+    lowered = part.lower()
+    if lowered.startswith("0x"):
+        return int(lowered, 16)
+    if len(lowered) > 1 and lowered.startswith("0"):
+        return int(lowered, 8)
+    return int(lowered, 10)
+
+
+def get_header(headers: Any, key: str, default: str = "") -> str:
+    getter = getattr(headers, "get", None)
+    if callable(getter):
+        return str(getter(key, default) or "")
+    return default
+
+
+def truthy(value: str) -> bool:
+    return value.lower() in {"1", "true", "yes", "on"}
 
 
 def main(argv: list[str] | None = None) -> int:

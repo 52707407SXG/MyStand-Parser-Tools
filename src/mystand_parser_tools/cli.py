@@ -25,7 +25,7 @@ import zipfile
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 from xml.dom import minidom
 
 
@@ -200,10 +200,20 @@ def parse_xml_file(path: Path, result: dict[str, Any]) -> str:
     return "```xml\n" + pretty.strip()[:80_000] + "\n```"
 
 
-def fetch_url(url: str) -> str:
+class SafeRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
+        validate_url_allowed(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def fetch_url(url: str, opener: Any | None = None) -> str:
     validate_url_allowed(url)
     request = Request(url, headers={"User-Agent": "MyStandParser/1.0"})
-    with urlopen(request, timeout=20) as response:
+    url_opener = opener or build_opener(SafeRedirectHandler())
+    with url_opener.open(request, timeout=20) as response:
+        final_url = response.geturl() if hasattr(response, "geturl") else ""
+        if final_url:
+            validate_url_allowed(str(final_url))
         charset = response.headers.get_content_charset() or "utf-8"
         return response.read().decode(charset, errors="replace")
 
@@ -341,7 +351,13 @@ def parse_with_agent_browser(url: str, result: dict[str, Any], *, capture_screen
     if payload.get("title"):
         result["source"]["title"] = payload.get("title")
     if payload.get("finalUrl"):
-        result["source"]["finalUrl"] = payload.get("finalUrl")
+        final_url = str(payload.get("finalUrl") or "")
+        try:
+            validate_url_allowed(final_url)
+        except ValueError as exc:
+            result["errors"].append(f"浏览器最终 URL 被安全策略拦截：{exc}")
+            return ""
+        result["source"]["finalUrl"] = final_url
     if payload.get("status"):
         result["source"]["status"] = payload.get("status")
 

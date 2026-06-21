@@ -48,15 +48,6 @@ class ParserJobQueue:
 
     def submit(self, input_uri: str) -> dict[str, Any]:
         self.cleanup()
-        with self.lock:
-            active_jobs = self._active_count_locked()
-            if active_jobs >= self.max_jobs:
-                return {
-                    "ok": False,
-                    "error": "queue_full",
-                    "message": f"parser active job queue is full: {active_jobs} >= {self.max_jobs}",
-                    "status": "rejected",
-                }
         job_id = uuid.uuid4().hex
         record = {
             "ok": True,
@@ -70,6 +61,14 @@ class ParserJobQueue:
             "error": "",
         }
         with self.lock:
+            active_jobs = self._active_count_locked()
+            if active_jobs >= self.max_jobs:
+                return {
+                    "ok": False,
+                    "error": "queue_full",
+                    "message": f"parser active job queue is full: {active_jobs} >= {self.max_jobs}",
+                    "status": "rejected",
+                }
             self.jobs[job_id] = record
         self.executor.submit(self._run_job, job_id)
         return self.get(job_id) or record

@@ -115,6 +115,7 @@ x-mystand-parser-token: change-me
 - 拦截 ZIP 路径穿越。
 - URL 只允许 `http` / `https`。
 - 拦截 localhost、内网 IP、`.local`、`.internal`、`.lan`，包括 DNS 解析到内网的情况。
+- 普通 URL 抓取会在每次 redirect 前校验目标地址，并在响应 `final URL` 再校验一次；`agent-browser` 兜底也会校验浏览器返回的 `finalUrl`，命中内网/保留地址时返回结构化错误，不把页面内容交给 Agent。
 - DWG、超大 PDF、视频、音频等返回 `worker_required`，不伪解析。
 
 详见：

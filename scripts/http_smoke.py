@@ -6,10 +6,17 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import tempfile
+import threading
 import time
+import types
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
+
+from mystand_parser_tools import cli as parser_cli
+from mystand_parser_tools import server as parser_server
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -108,7 +115,124 @@ def wait_for_job(job_id: str, port: int = 8799) -> dict:
     raise AssertionError(f"job did not finish: {job_id}")
 
 
+class _HeaderStub:
+    def get_content_charset(self) -> str:
+        return "utf-8"
+
+
+class _ResponseStub:
+    headers = _HeaderStub()
+
+    def __init__(self, final_url: str, body: str = "<html><body>ok</body></html>"):
+        self.final_url = final_url
+        self.body = body.encode("utf-8")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def geturl(self) -> str:
+        return self.final_url
+
+    def read(self) -> bytes:
+        return self.body
+
+
+class _OpenerStub:
+    def __init__(self, final_url: str):
+        self.final_url = final_url
+
+    def open(self, request: Request, timeout: int = 20) -> _ResponseStub:
+        return _ResponseStub(self.final_url)
+
+
+def smoke_url_final_guards() -> None:
+    try:
+        parser_cli.SafeRedirectHandler().redirect_request(None, None, 302, "Found", {}, "http://127.0.0.1/internal")
+    except ValueError as exc:
+        assert "已拦截" in str(exc), exc
+    else:
+        raise AssertionError("redirect to localhost was not blocked")
+
+    original_getaddrinfo = parser_cli.socket.getaddrinfo
+    parser_cli.socket.getaddrinfo = lambda *args, **kwargs: [(None, None, None, "", ("93.184.216.34", 443))]
+    try:
+        try:
+            parser_cli.fetch_url("https://example.com/article", opener=_OpenerStub("http://127.0.0.1/private"))
+        except ValueError as exc:
+            assert "已拦截" in str(exc), exc
+        else:
+            raise AssertionError("fetch_url accepted blocked final URL")
+    finally:
+        parser_cli.socket.getaddrinfo = original_getaddrinfo
+
+
+def smoke_agent_browser_final_guard() -> None:
+    result = parser_cli.build_result("https://example.com/dynamic")
+    original_command = parser_cli.AGENT_BROWSER_COMMAND
+    original_run = parser_cli.subprocess.run
+    with tempfile.NamedTemporaryFile("w", delete=False) as command_file:
+        command_file.write("#!/usr/bin/env node\n")
+        command_path = command_file.name
+    parser_cli.AGENT_BROWSER_COMMAND = command_path
+    parser_cli.subprocess.run = lambda *args, **kwargs: types.SimpleNamespace(
+        returncode=0,
+        stdout=json.dumps({"finalUrl": "http://127.0.0.1/browser-final", "text": "secret"}),
+        stderr="",
+    )
+    try:
+        text = parser_cli.parse_with_agent_browser("https://example.com/dynamic", result)
+        assert text == "", text
+        assert any("最终 URL" in item and "已拦截" in item for item in result["errors"]), result
+    finally:
+        parser_cli.AGENT_BROWSER_COMMAND = original_command
+        parser_cli.subprocess.run = original_run
+        Path(command_path).unlink(missing_ok=True)
+
+
+def smoke_job_queue_submit_lock() -> None:
+    queue = parser_server.ParserJobQueue(max_workers=1, max_jobs=1, timeout=1, ttl_seconds=60, max_job_history=10)
+    original_uuid4 = parser_server.uuid.uuid4
+    original_run_parser_process = parser_server.run_parser_process
+    barrier = threading.Barrier(8)
+    counter_lock = threading.Lock()
+    counter = {"value": 0}
+
+    def fake_uuid4():
+        barrier.wait(timeout=5)
+        with counter_lock:
+            counter["value"] += 1
+            value = counter["value"]
+        return types.SimpleNamespace(hex=f"job-{value}")
+
+    def slow_parser(input_uri: str, timeout: int) -> dict:
+        time.sleep(0.25)
+        return {"ok": True, "payload": {"content": {"markdown": "ok"}, "errors": []}, "error": ""}
+
+    parser_server.uuid.uuid4 = fake_uuid4
+    parser_server.run_parser_process = slow_parser
+    try:
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            results = list(executor.map(lambda index: queue.submit(f"input-{index}"), range(8)))
+        accepted = [item for item in results if item.get("ok", True)]
+        rejected = [item for item in results if not item.get("ok", True)]
+        assert len(accepted) == 1, results
+        assert len(rejected) == 7, results
+        assert all(item["error"] == "queue_full" for item in rejected), results
+        assert queue.stats()["active"] <= 1, queue.stats()
+    finally:
+        parser_server.uuid.uuid4 = original_uuid4
+        parser_server.run_parser_process = original_run_parser_process
+        queue.executor.shutdown(wait=True, cancel_futures=True)
+
+
 def main() -> int:
+    smoke_url_final_guards()
+    smoke_agent_browser_final_guard()
+    smoke_job_queue_submit_lock()
+
     assert_command_fails(["serve", "--host", "0.0.0.0", "--port", "8797"], "Refusing public parser bind")
     assert_command_fails(["serve", "--host", "0.0.0.0", "--port", "8797", "--allow-public-bind"], "requires MYSTAND_PARSER_HTTP_TOKEN")
     assert_command_fails(["serve", "--host", "127.0.0.1", "--port", "8797", "--require-token"], "require-token mode requires")

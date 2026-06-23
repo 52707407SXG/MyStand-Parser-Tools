@@ -751,6 +751,8 @@ def main(argv: list[str] | None = None) -> int:
         return run_serve_command(argv[1:])
     if argv and argv[0] == "install-links":
         return run_install_links_command(argv[1:])
+    if argv and argv[0] == "install-xiaoban-tool":
+        return run_install_xiaoban_tool_command(argv[1:])
 
     parser = argparse.ArgumentParser(description="Parse files or URLs into My Stand standard JSON.")
     parser.add_argument("--input", required=True, help="Local file path or http(s) URL.")
@@ -833,6 +835,29 @@ def run_install_links_command(argv: list[str]) -> int:
     if not legacy.exists():
         legacy.symlink_to(target)
     print(json.dumps({"ok": True, "target": str(target), "legacy": str(legacy)}, ensure_ascii=False, indent=2))
+    return 0
+
+
+def run_install_xiaoban_tool_command(argv: list[str]) -> int:
+    from .xiaoban import build_xiaoban_tool_module
+
+    parser = argparse.ArgumentParser(description="Install MyStand parser as a native Xiaoban tool.")
+    parser.add_argument("--xiaoban-root", default=os.environ.get("XIAOBAN_AGENT_ROOT", "/opt/xiaoban-agent"))
+    parser.add_argument("--parser-src", default=str(Path(__file__).resolve().parents[1]))
+    args = parser.parse_args(argv)
+
+    xiaoban_root = Path(args.xiaoban_root).expanduser().resolve()
+    tools_dir = xiaoban_root / "tools"
+    if not tools_dir.is_dir():
+        raise SystemExit(f"Xiaoban tools directory not found: {tools_dir}")
+
+    target = tools_dir / "mystand_parser_tool.py"
+    source = build_xiaoban_tool_module(args.parser_src)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, dir=str(tools_dir)) as tmp:
+        tmp.write(source)
+        tmp_path = Path(tmp.name)
+    os.replace(tmp_path, target)
+    print(json.dumps({"ok": True, "target": str(target)}, ensure_ascii=False, indent=2))
     return 0
 
 

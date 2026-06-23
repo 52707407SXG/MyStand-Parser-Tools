@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mystand-parser-tools"
-version = "0.1.0"
+version = "0.1.1"
 description = "My Stand common parser tools for Agents, modules, files, URLs, WeChat articles, OCR, Office, PDF, ZIP, and CAD."
 readme = "README.md"
 requires-python = ">=3.10"

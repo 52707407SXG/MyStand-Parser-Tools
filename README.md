@@ -31,6 +31,19 @@ python -m mystand_parser_tools --input README.md --output test-output/readme.jso
 mystand-parser --input README.md --output test-output/readme.json
 ```
 
+接入站小伴时，以 Xiaoban-Agent 的原生工具注册接口为准，由 Parser Tools 安装一个薄桥接文件到小伴仓库：
+
+```bash
+mystand-parser install-xiaoban-tool --xiaoban-root /opt/xiaoban-agent
+```
+
+安装后小伴会得到 `mystand_parse` 工具，底层仍调用统一解析入口。小伴运行环境需要配置：
+
+```bash
+MYSTAND_PARSER_COMMAND=/opt/mystand-parser-tools/bin/mystand-parser
+MYSTAND_PARSER_PYTHONPATH=/opt/mystand-parser-tools/src
+```
+
 启动本机内部 HTTP 服务：
 
 ```bash

@@ -44,7 +44,6 @@ URL_AUTH_PATTERNS = [
     "u2f",
     "sign in",
     "signin",
-    "验证",
     "请先登录",
     "need to sign in",
     "set access permissions",

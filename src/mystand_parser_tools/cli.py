@@ -54,6 +54,9 @@ WECHAT_VERIFY_PATTERNS = ["环境异常", "完成验证后即可继续访问", "
 AGENT_BROWSER_COMMAND = os.environ.get("MYSTAND_AGENT_BROWSER_COMMAND", "/opt/agent-tools/browser/agent-browser.mjs")
 HERMES_WEB_EXTRACT_CONTAINER = os.environ.get("MYSTAND_HERMES_WEB_EXTRACT_CONTAINER", "hermes-lucan")
 HERMES_WEB_EXTRACT_PYTHON = os.environ.get("MYSTAND_HERMES_WEB_EXTRACT_PYTHON", "/opt/hermes/.venv/bin/python3")
+XIAOBAN_WEB_EXTRACT_ROOT = os.environ.get("MYSTAND_XIAOBAN_WEB_EXTRACT_ROOT", "/opt/xiaoban-agent")
+XIAOBAN_WEB_EXTRACT_PYTHON = os.environ.get("MYSTAND_XIAOBAN_WEB_EXTRACT_PYTHON", "/opt/xiaoban-agent/.venv/bin/python")
+XIAOBAN_WEB_EXTRACT_ENV_FILE = os.environ.get("MYSTAND_XIAOBAN_WEB_EXTRACT_ENV_FILE", "/opt/xiaoban-agent/.env")
 
 
 def classify_url_source(url: str) -> str:
@@ -299,6 +302,8 @@ def quality_errors_for_url(markdown: str, source_type: str = "url") -> list[str]
     compact = re.sub(r"\s+", "", markdown or "")
     if source_type == "wechat_article" and any(pattern.lower() in lower_markdown or pattern in compact for pattern in WECHAT_VERIFY_PATTERNS):
         return ["微信公众号返回验证/环境异常页面，不是文章正文；需要已验证浏览器会话、授权快照或更换出口 IP。"]
+    if source_type == "wechat_article" and re.search(r"(?m)^#\s+\S+", markdown or "") and len(visible_text) >= 500:
+        return []
     if len(visible_text) < 20:
         return ["URL 解析结果正文过短，可能是空壳页面、登录页或前端动态文档；需要平台连接器、导出文件或已授权快照。"]
     if any(pattern in lower_markdown for pattern in URL_AUTH_PATTERNS):
@@ -390,6 +395,48 @@ def parse_with_agent_browser(url: str, result: dict[str, Any], *, capture_screen
     return text
 
 
+def parse_with_xiaoban_web_extract(url: str, result: dict[str, Any]) -> str:
+    if truthy(os.environ.get("MYSTAND_XIAOBAN_WEB_EXTRACT_DISABLED", "")):
+        return ""
+    python_path = Path(XIAOBAN_WEB_EXTRACT_PYTHON)
+    root_path = Path(XIAOBAN_WEB_EXTRACT_ROOT)
+    if not python_path.exists() or not root_path.exists():
+        result["warnings"].append(f"小伴 web_extract 兜底不可用：{XIAOBAN_WEB_EXTRACT_PYTHON} 或 {XIAOBAN_WEB_EXTRACT_ROOT} 不存在。")
+        return ""
+
+    script = "\n".join(
+        [
+            "import asyncio, json, os, sys",
+            "from pathlib import Path",
+            "env_file = Path(sys.argv[2])",
+            "if env_file.exists():",
+            "    for raw in env_file.read_text(encoding='utf-8', errors='ignore').splitlines():",
+            "        line = raw.strip()",
+            "        if not line or line.startswith('#') or '=' not in line:",
+            "            continue",
+            "        key, value = line.split('=', 1)",
+            "        value = value.strip().strip('\\\"').strip(\"'\")",
+            "        os.environ.setdefault(key.strip(), value)",
+            "from tools.web_tools import web_extract_tool",
+            "async def main():",
+            "    print(await web_extract_tool([sys.argv[1]], use_llm_processing=False))",
+            "asyncio.run(main())",
+        ]
+    )
+    cmd = [str(python_path), "-c", script, url, XIAOBAN_WEB_EXTRACT_ENV_FILE]
+    timeout = int(os.environ.get("MYSTAND_XIAOBAN_WEB_EXTRACT_TIMEOUT", "60") or "60")
+    try:
+        completed = subprocess.run(cmd, check=False, capture_output=True, text=True, timeout=timeout, cwd=str(root_path))
+    except subprocess.TimeoutExpired:
+        result["warnings"].append("小伴 web_extract 兜底超时。")
+        return ""
+    except Exception as exc:
+        result["warnings"].append(f"小伴 web_extract 兜底失败：{exc}")
+        return ""
+
+    return parse_web_extract_stdout(completed, "小伴 web_extract", "xiaoban-web-extract", result)
+
+
 def parse_with_hermes_web_extract(url: str, result: dict[str, Any]) -> str:
     if truthy(os.environ.get("MYSTAND_HERMES_WEB_EXTRACT_DISABLED", "")):
         return ""
@@ -427,29 +474,33 @@ def parse_with_hermes_web_extract(url: str, result: dict[str, Any]) -> str:
         result["warnings"].append(f"Hermes web_extract 兜底失败：{exc}")
         return ""
 
+    return parse_web_extract_stdout(completed, "Hermes web_extract", "hermes-web-extract", result)
+
+
+def parse_web_extract_stdout(completed: subprocess.CompletedProcess[str], label: str, provider: str, result: dict[str, Any]) -> str:
     if completed.returncode != 0 and not completed.stdout.strip():
-        result["warnings"].append((completed.stderr or "Hermes web_extract 兜底失败。").strip())
+        result["warnings"].append((completed.stderr or f"{label} 兜底失败。").strip())
         return ""
 
     try:
         payload = json.loads(completed.stdout)
     except Exception as exc:
-        result["warnings"].append(f"Hermes web_extract 输出不是有效 JSON：{exc}")
+        result["warnings"].append(f"{label} 输出不是有效 JSON：{exc}")
         return ""
 
     items = payload.get("results") if isinstance(payload, dict) else None
     if not isinstance(items, list) or not items:
-        result["warnings"].append("Hermes web_extract 未返回正文结果。")
+        result["warnings"].append(f"{label} 未返回正文结果。")
         return ""
     item = items[0] if isinstance(items[0], dict) else {}
     if item.get("title"):
         result["source"]["title"] = item.get("title")
     if item.get("error"):
-        result["warnings"].append(f"Hermes web_extract 返回错误：{item.get('error')}")
+        result["warnings"].append(f"{label} 返回错误：{item.get('error')}")
         return ""
     markdown = str(item.get("content") or "").strip()
     if markdown:
-        result["source"]["extractProvider"] = "hermes-web-extract"
+        result["source"]["extractProvider"] = provider
     return markdown
 
 
@@ -609,14 +660,21 @@ def parse_url(url: str, result: dict[str, Any]) -> dict[str, Any]:
         wechat_markdown = parse_wechat_article(url, result)
         if wechat_markdown:
             return finalize(result, wechat_markdown, "wechat-article-parser")
-        hermes_markdown = parse_with_hermes_web_extract(url, result)
-        hermes_quality_errors = quality_errors_for_url(hermes_markdown, source_type)
-        if hermes_markdown and not hermes_quality_errors:
+        web_extract_markdown = parse_with_xiaoban_web_extract(url, result)
+        web_extract_tool = "xiaoban-web-extract"
+        web_extract_quality_errors = quality_errors_for_url(web_extract_markdown, source_type)
+        if not web_extract_markdown or web_extract_quality_errors:
+            if web_extract_quality_errors:
+                result["warnings"].extend(web_extract_quality_errors)
+            web_extract_markdown = parse_with_hermes_web_extract(url, result)
+            web_extract_tool = "hermes-web-extract"
+            web_extract_quality_errors = quality_errors_for_url(web_extract_markdown, source_type)
+        if web_extract_markdown and not web_extract_quality_errors:
             if result["source"].get("wechatVerifyRequired"):
-                result["warnings"].append("微信公众号专用解析遇到验证后，已自动改用 Hermes web_extract 读取正文。")
-            return finalize(result, hermes_markdown, "hermes-web-extract")
-        if hermes_quality_errors:
-            result["warnings"].extend(hermes_quality_errors)
+                result["warnings"].append(f"微信公众号专用解析遇到验证后，已自动改用 {web_extract_tool} 读取正文。")
+            return finalize(result, web_extract_markdown, web_extract_tool)
+        if web_extract_quality_errors:
+            result["warnings"].extend(web_extract_quality_errors)
 
     fetch_errors: list[str] = []
     try:

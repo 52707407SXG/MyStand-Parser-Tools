@@ -49,6 +49,7 @@ URL_AUTH_PATTERNS = [
     "set access permissions",
 ]
 URL_SOFT_LOGIN_PATTERNS = ["login", "登录", "登录/注册"]
+WECHAT_VERIFY_PATTERNS = ["环境异常", "完成验证后即可继续访问", "去验证", "appmsgcaptcha", "wappoc_appmsgcaptcha"]
 AGENT_BROWSER_COMMAND = os.environ.get("MYSTAND_AGENT_BROWSER_COMMAND", "/opt/agent-tools/browser/agent-browser.mjs")
 
 
@@ -265,7 +266,8 @@ def parse_wechat_article(url: str, result: dict[str, Any]) -> str:
     try:
         article = parse(url, timeout=timeout, proxy=proxy)
     except WeChatVerifyError:
-        result["errors"].append("微信返回验证码/人机验证页面，不是文章正文；请稍后重试、更换出口 IP，或使用已授权快照。")
+        result["source"]["wechatVerifyRequired"] = True
+        result["warnings"].append("微信公众号专用解析遇到验证码/人机验证，继续尝试普通 URL 和服务器浏览器兜底。")
         return ""
     except Exception as exc:
         result["warnings"].append(f"微信公众号专用解析失败，已改用普通网页解析：{exc}")
@@ -292,6 +294,8 @@ def quality_errors_for_url(markdown: str, source_type: str = "url") -> list[str]
     visible_text = re.sub(r"\s+", "", markdown or "")
     lower_markdown = (markdown or "").lower()
     compact = re.sub(r"\s+", "", markdown or "")
+    if source_type == "wechat_article" and any(pattern.lower() in lower_markdown or pattern in compact for pattern in WECHAT_VERIFY_PATTERNS):
+        return ["微信公众号返回验证/环境异常页面，不是文章正文；需要已验证浏览器会话、授权快照或更换出口 IP。"]
     if len(visible_text) < 20:
         return ["URL 解析结果正文过短，可能是空壳页面、登录页或前端动态文档；需要平台连接器、导出文件或已授权快照。"]
     if any(pattern in lower_markdown for pattern in URL_AUTH_PATTERNS):
@@ -537,7 +541,7 @@ def parse_url(url: str, result: dict[str, Any]) -> dict[str, Any]:
     source_type = str(result.get("source", {}).get("type") or "url")
     if source_type == "wechat_article":
         wechat_markdown = parse_wechat_article(url, result)
-        if wechat_markdown or result["errors"]:
+        if wechat_markdown:
             return finalize(result, wechat_markdown, "wechat-article-parser")
 
     fetch_errors: list[str] = []
@@ -557,7 +561,7 @@ def parse_url(url: str, result: dict[str, Any]) -> dict[str, Any]:
                 result["warnings"].append("普通 URL 下载未拿到可靠正文，已自动改用服务器浏览器读取成功。")
             return finalize(result, browser_markdown, "agent-browser")
         if browser_markdown:
-            markdown = browser_markdown
+            markdown = "" if source_type == "wechat_article" else browser_markdown
             result["errors"].extend(browser_quality_errors)
             if direct_quality_errors:
                 result["warnings"].extend(direct_quality_errors)

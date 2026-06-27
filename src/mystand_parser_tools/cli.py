@@ -17,6 +17,7 @@ import json
 import mimetypes
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -51,6 +52,8 @@ URL_AUTH_PATTERNS = [
 URL_SOFT_LOGIN_PATTERNS = ["login", "登录", "登录/注册"]
 WECHAT_VERIFY_PATTERNS = ["环境异常", "完成验证后即可继续访问", "去验证", "appmsgcaptcha", "wappoc_appmsgcaptcha"]
 AGENT_BROWSER_COMMAND = os.environ.get("MYSTAND_AGENT_BROWSER_COMMAND", "/opt/agent-tools/browser/agent-browser.mjs")
+HERMES_WEB_EXTRACT_CONTAINER = os.environ.get("MYSTAND_HERMES_WEB_EXTRACT_CONTAINER", "hermes-lucan")
+HERMES_WEB_EXTRACT_PYTHON = os.environ.get("MYSTAND_HERMES_WEB_EXTRACT_PYTHON", "/opt/hermes/.venv/bin/python3")
 
 
 def classify_url_source(url: str) -> str:
@@ -387,6 +390,69 @@ def parse_with_agent_browser(url: str, result: dict[str, Any], *, capture_screen
     return text
 
 
+def parse_with_hermes_web_extract(url: str, result: dict[str, Any]) -> str:
+    if truthy(os.environ.get("MYSTAND_HERMES_WEB_EXTRACT_DISABLED", "")):
+        return ""
+    if not shutil.which("docker"):
+        result["warnings"].append("Hermes web_extract 兜底不可用：宿主机未找到 docker。")
+        return ""
+
+    script = "\n".join(
+        [
+            "import asyncio, sys",
+            "from tools.web_tools import web_extract_tool",
+            "async def main():",
+            "    print(await web_extract_tool([sys.argv[1]], use_llm_processing=False))",
+            "asyncio.run(main())",
+        ]
+    )
+    cmd = [
+        "docker",
+        "exec",
+        "-w",
+        "/opt/hermes",
+        HERMES_WEB_EXTRACT_CONTAINER,
+        HERMES_WEB_EXTRACT_PYTHON,
+        "-c",
+        script,
+        url,
+    ]
+    timeout = int(os.environ.get("MYSTAND_HERMES_WEB_EXTRACT_TIMEOUT", "60") or "60")
+    try:
+        completed = subprocess.run(cmd, check=False, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        result["warnings"].append("Hermes web_extract 兜底超时。")
+        return ""
+    except Exception as exc:
+        result["warnings"].append(f"Hermes web_extract 兜底失败：{exc}")
+        return ""
+
+    if completed.returncode != 0 and not completed.stdout.strip():
+        result["warnings"].append((completed.stderr or "Hermes web_extract 兜底失败。").strip())
+        return ""
+
+    try:
+        payload = json.loads(completed.stdout)
+    except Exception as exc:
+        result["warnings"].append(f"Hermes web_extract 输出不是有效 JSON：{exc}")
+        return ""
+
+    items = payload.get("results") if isinstance(payload, dict) else None
+    if not isinstance(items, list) or not items:
+        result["warnings"].append("Hermes web_extract 未返回正文结果。")
+        return ""
+    item = items[0] if isinstance(items[0], dict) else {}
+    if item.get("title"):
+        result["source"]["title"] = item.get("title")
+    if item.get("error"):
+        result["warnings"].append(f"Hermes web_extract 返回错误：{item.get('error')}")
+        return ""
+    markdown = str(item.get("content") or "").strip()
+    if markdown:
+        result["source"]["extractProvider"] = "hermes-web-extract"
+    return markdown
+
+
 def parse_with_markitdown(path: Path, result: dict[str, Any]) -> str:
     try:
         from markitdown import MarkItDown
@@ -543,6 +609,14 @@ def parse_url(url: str, result: dict[str, Any]) -> dict[str, Any]:
         wechat_markdown = parse_wechat_article(url, result)
         if wechat_markdown:
             return finalize(result, wechat_markdown, "wechat-article-parser")
+        hermes_markdown = parse_with_hermes_web_extract(url, result)
+        hermes_quality_errors = quality_errors_for_url(hermes_markdown, source_type)
+        if hermes_markdown and not hermes_quality_errors:
+            if result["source"].get("wechatVerifyRequired"):
+                result["warnings"].append("微信公众号专用解析遇到验证后，已自动改用 Hermes web_extract 读取正文。")
+            return finalize(result, hermes_markdown, "hermes-web-extract")
+        if hermes_quality_errors:
+            result["warnings"].extend(hermes_quality_errors)
 
     fetch_errors: list[str] = []
     try:
